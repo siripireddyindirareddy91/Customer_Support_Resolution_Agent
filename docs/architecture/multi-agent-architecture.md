@@ -1,0 +1,5 @@
+# Multi-agent architecture
+
+The graph separates responsibilities into intent classification, supervisor, planner, deterministic router, tool execution, policy retrieval, resolution, critic, validator, and customer response. These are controlled workflow stages, not autonomous agents with unrestricted tools. Deterministic phrase routing handles known intents; an optional structured LangChain/OpenAI classifier is used only when `OPENAI_API_KEY` is configured and deterministic matching has no result.
+
+The only operational tool calls currently enabled are `get_order` and `get_delivery_status`. Both require the authenticated customer ID and enforce order ownership. High-risk mutations are omitted rather than simulated. Human requests become an explicit escalation state; ticket persistence and agent assignment remain future work.
