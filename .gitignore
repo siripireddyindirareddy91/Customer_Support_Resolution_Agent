@@ -1,0 +1,11 @@
+.env*
+!.env.example
+.venv/
+.vercel/
+.remote-project/
+node_modules/
+dist/
+__pycache__/
+.pytest_cache/
+*.db
+*.db-*

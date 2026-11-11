@@ -1,0 +1,26 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: resolveflow
+      POSTGRES_PASSWORD: resolveflow-local
+      POSTGRES_DB: resolveflow
+    volumes:
+      - database:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U resolveflow"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+  app:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://resolveflow:resolveflow-local@db:5432/resolveflow
+      JWT_SECRET: ${JWT_SECRET:-resolveflow-local-development-only-change-me}
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8000:8000"
+volumes:
+  database:
