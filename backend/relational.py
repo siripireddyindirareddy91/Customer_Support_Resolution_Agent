@@ -53,8 +53,8 @@ class DomainStore:
               Column("passed", Integer, nullable=False))
         table("audit_investigation_links", fk("investigation_id", "investigations"), fk("event_id", "audit_events"))
 
-    def write(self, connection, name, identifier, **values):
-        table = self.tables[name]
+    def write(self, connection, table_name, identifier, **values):
+        table = self.tables[table_name]
         from sqlalchemy.dialects.postgresql import insert as pg_insert
         from sqlalchemy.dialects.sqlite import insert as sqlite_insert
         upsert = pg_insert if connection.dialect.name == "postgresql" else sqlite_insert
