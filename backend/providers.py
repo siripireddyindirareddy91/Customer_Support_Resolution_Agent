@@ -38,7 +38,7 @@ def generate_draft(action, reason, fallback, gateway_token=None):
     try:
         result = model_request("/chat/completions", {
             "model": os.environ["DRAFT_MODEL"],
-            "max_tokens": 180,
+            "max_tokens": 700,
             "messages": [
                 {"role": "system", "content": (
                     "Write a concise customer support reply. Use only the verified reason and next step. "
@@ -49,9 +49,11 @@ def generate_draft(action, reason, fallback, gateway_token=None):
                 {"role": "user", "content": json.dumps({"verified_reason": reason, "next_step": action})},
             ],
         }, gateway_token)
-        draft = result["choices"][0]["message"]["content"].strip()
+        raw = result["choices"][0]["message"]["content"] or ""
+        draft = re.sub(r"<think>.*?</think>", "", raw, flags=re.S).strip()
         if 20 <= len(draft) <= 1200 and not re.search(r"https?://|[<>]", draft, re.I):
             return draft, "llm"
-    except (OSError, KeyError, IndexError, TypeError, ValueError, AttributeError):
-        logging.getLogger(__name__).warning("Draft model unavailable. Using the evidence-based template.")
+    except (OSError, KeyError, IndexError, TypeError, ValueError, AttributeError) as error:
+        logging.getLogger(__name__).warning("Draft provider returned %s. Using the evidence-based template.",
+                                            getattr(error, "code", type(error).__name__))
     return fallback, "template"
