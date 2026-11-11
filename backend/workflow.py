@@ -12,6 +12,8 @@ class State(TypedDict, total=False):
     order_id: str
     customer_id: str
     complaint: str
+    context: str
+    priority: str
     trace: list[dict]
     order: dict | None
     tracking: list[dict]
@@ -38,6 +40,7 @@ def lookup(state, order_source=lookup_order, tracking_source=lookup_tracking):
 def classify(state):
     order = state.get("order")
     complaint = state["complaint"].lower()
+    untrusted_text = " ".join((complaint, state.get("context", "").lower()))
     evidence = [event["record_id"] for event in state["tracking"]]
     latest = state["tracking"][-1] if evidence else {}
     carrier = state.get("carrier") or {}
@@ -63,7 +66,7 @@ def classify(state):
     review = issue in {"UNKNOWN", "STATUS_CONFLICT", "MAJOR_DELAY", "LOST_SUSPECTED", "DAMAGED"}
     flags = [tag for tag, terms in {
         "REFUND": ("refund",), "FRAUD": ("ignore previous", "ignore all", "system prompt", "bypass", "fraud")
-    }.items() if any(term in complaint for term in terms)]
+    }.items() if any(term in untrusted_text for term in terms)]
     return {"classification": dict(issue_type=issue, severity="HIGH" if review or flags else
                                    "MEDIUM" if issue != "ON_TIME" else "LOW", confidence=score,
                                    reasoning=reason, evidence=evidence, flags=flags,
@@ -89,6 +92,7 @@ def handoff(state):
                                citations=state["policies"], confidence=classification["confidence"],
                                draft="Thanks for contacting support. " + classification["reasoning"] +
                                      " Our recommended next step is to " + action[0].lower() + action[1:] + ".",
+                               priority="Urgent" if classification["severity"] == "HIGH" else state.get("priority", "Normal"),
                                requires_approval=classification["requires_human_review"] or not state["policies"])}
 
 
@@ -102,9 +106,24 @@ def build_graph(checkpointer, search, order_source=lookup_order, tracking_source
         def run(state):
             started = perf_counter()
             result = operation(state)
+            if index == 0:
+                order = result["order"]
+                tools = ["lookup_order"]
+                references = []
+                if order:
+                    tools += ["lookup_tracking", "lookup_carrier_status", "lookup_customer_history"]
+                    references = [order["record_id"], result["carrier"]["record_id"],
+                                  *(row["record_id"] for row in result["tracking"] + result["history"])]
+            elif index == 1:
+                tools, references = [], result["classification"]["evidence"]
+            elif index == 2:
+                tools, references = ["retrieve_policy_passages"], [row["id"] for row in result["policies"]]
+            else:
+                tools, references = [], [row["id"] for row in result["resolution"]["citations"]]
             return {**result, "trace": [*state.get("trace", []),
                     dict(agent=AGENTS[index], duration_ms=round((perf_counter() - started) * 1000, 2),
-                         at=datetime.now(UTC).isoformat(), output=result, status="Completed")]}
+                         at=datetime.now(UTC).isoformat(), output=result, status="Completed",
+                         tool_calls=tools, references=references)]}
         return run
 
     graph = StateGraph(State)

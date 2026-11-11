@@ -1,14 +1,19 @@
+import asyncio
 import io
+import json
 import os
 import re
 import secrets
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
+from time import time
 from uuid import uuid4
 
 import jwt
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query as Param, Request, UploadFile
+from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from langgraph.checkpoint.postgres import PostgresSaver
@@ -16,7 +21,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 from pwdlib import PasswordHash
 from pydantic import BaseModel, Field
-from sqlalchemy import JSON, Column, MetaData, String, Table, create_engine, insert, select, text, update
+from sqlalchemy import JSON, URL, Column, Integer, MetaData, String, Table, create_engine, delete, func, insert, select, text, update
 from sqlalchemy.exc import IntegrityError
 
 from .sources import AGENTS, POLICIES, lookup_order, lookup_tracking, order_ids
@@ -28,8 +33,11 @@ DATABASE = (os.getenv("POSTGRES_URL_NON_POOLING") or os.getenv("DATABASE_URL") o
 SECRET = os.getenv("JWT_SECRET") or secrets.token_hex(32)
 if os.getenv("VERCEL") and (not DATABASE or not os.getenv("JWT_SECRET") or len(SECRET) < 32):
     raise RuntimeError("Vercel requires DATABASE_URL and a JWT_SECRET of at least 32 characters.")
-engine = create_engine(DATABASE.replace("postgresql://", "postgresql+psycopg://", 1)
-                       if DATABASE else "sqlite:///resolveflow.db", pool_pre_ping=True)
+DATA_DIR = Path(os.getenv("RESOLVEFLOW_DATA_DIR", ".")).resolve()
+if not DATABASE:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+engine = create_engine(DATABASE.replace("postgresql://", "postgresql+psycopg://", 1) if DATABASE
+                       else URL.create("sqlite", database=str(DATA_DIR / "resolveflow.db")), pool_pre_ping=True)
 schema = MetaData()
 
 
@@ -46,6 +54,10 @@ audit = collection("audit_events")
 evaluations = collection("evaluation_runs")
 demo_orders = collection("orders")
 demo_tracking = collection("tracking_events")
+auth_limits = Table("auth_rate_limits", schema,
+                    Column("key", String(64), primary_key=True),
+                    Column("bucket", Integer, primary_key=True, index=True),
+                    Column("attempts", Integer, nullable=False))
 passwords = PasswordHash.recommended()
 bearer = HTTPBearer(auto_error=False)
 
@@ -114,7 +126,8 @@ def search(query, owner=None, *, issue_lookup=False):
 @asynccontextmanager
 async def lifespan(app):
     initialize_store()
-    context = PostgresSaver.from_conn_string(DATABASE) if DATABASE else SqliteSaver.from_conn_string("checkpoints.db")
+    context = (PostgresSaver.from_conn_string(DATABASE) if DATABASE
+               else SqliteSaver.from_conn_string(str(DATA_DIR / "checkpoints.db")))
     with context as checkpointer:
         checkpointer.setup()
         app.state.checkpointer = checkpointer
@@ -147,6 +160,21 @@ class Decision(BaseModel):
     notes: str = Field(min_length=3, max_length=2000)
 
 
+class Evidence(BaseModel):
+    context: str = Field(min_length=5, max_length=4000)
+
+
+class Draft(BaseModel):
+    draft: str = Field(min_length=5, max_length=4000)
+
+
+class PolicyText(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    version: str = Field(default="1.0", min_length=1, max_length=30)
+    tags: str = Field(default="", max_length=200)
+    content: str = Field(min_length=1, max_length=250_000)
+
+
 def token(email):
     return {"token": jwt.encode({"sub": email, "exp": datetime.now(UTC) + timedelta(hours=8)}, SECRET, algorithm="HS256")}
 
@@ -163,13 +191,41 @@ def account(auth: HTTPAuthorizationCredentials | None = Depends(bearer)):
     return user
 
 
+def writer(user=Depends(account)):
+    if user["role"] == "AUDITOR":
+        raise HTTPException(403, "This account has read-only access.")
+    return user
+
+
+def reviewer(user):
+    return user["role"] in {"ADMIN", "SUPPORT_MANAGER"}
+
+
 @app.get("/api/health")
 def health():
     return {"status": "ok", "data": "synthetic"}
 
 
+def check_auth_rate(request):
+    if DATABASE:
+        from sqlalchemy.dialects.postgresql import insert as upsert
+    else:
+        from sqlalchemy.dialects.sqlite import insert as upsert
+    address = request.client.host if request.client else "unknown"
+    key = sha256((SECRET + address).encode()).hexdigest()
+    bucket = int(time()) // 60
+    with engine.begin() as connection:
+        connection.execute(delete(auth_limits).where(auth_limits.c.bucket < bucket - 10))
+        query = upsert(auth_limits).values(key=key, bucket=bucket, attempts=1).on_conflict_do_update(
+            index_elements=["key", "bucket"], set_={"attempts": auth_limits.c.attempts + 1})
+        attempts = connection.execute(query.returning(auth_limits.c.attempts)).scalar_one()
+    if attempts > 30:
+        raise HTTPException(429, "Too many authentication attempts. Try again in a minute.", headers={"Retry-After": "60"})
+
+
 @app.post(PREFIX + "/auth/register", status_code=201)
-def register(body: Credentials):
+def register(body: Credentials, request: Request):
+    check_auth_rate(request)
     email = body.email.lower()
     try:
         save(users, email, dict(id=email, password=passwords.hash(body.password), role="SUPPORT_AGENT"))
@@ -179,7 +235,8 @@ def register(body: Credentials):
 
 
 @app.post(PREFIX + "/auth/login")
-def login(body: Credentials):
+def login(body: Credentials, request: Request):
+    check_auth_rate(request)
     email = body.email.lower()
     user = fetch(users, email)
     if not passwords.verify(body.password, user["password"] if user else DUMMY_HASH) or not user:
@@ -206,11 +263,13 @@ def transition(item, owner, expected, **changes):
     previous = item["status"]
     if previous not in expected:
         raise HTTPException(409, f"Cannot perform this action while the investigation is {previous}.")
-    changed = {**item, **changes}
+    revision = item.get("revision", 0)
+    changed = {**item, **changes, "revision": revision + 1}
     with engine.begin() as connection:
         result = connection.execute(update(cases).where(
             cases.c.id == item["id"], cases.c.owner == owner,
-            cases.c.payload["status"].as_string() == previous).values(payload=changed))
+            cases.c.payload["status"].as_string() == previous,
+            func.coalesce(cases.c.payload["revision"].as_integer(), 0) == revision).values(payload=changed))
         if result.rowcount != 1:
             raise HTTPException(409, "The investigation changed. Refresh and try again.")
     return changed
@@ -226,7 +285,7 @@ def config(identifier):
 
 
 @app.post(PREFIX + "/investigations", status_code=201)
-def create(body: Investigation, user=Depends(account)):
+def create(body: Investigation, user=Depends(writer)):
     match = re.search(r"\bORD-\d+\b", body.complaint, re.I)
     order_id = body.order_id.strip().upper() or (match.group().upper() if match else "")
     if not re.fullmatch(r"ORD-\d+", order_id):
@@ -239,8 +298,9 @@ def create(body: Investigation, user=Depends(account)):
 
 
 @app.get(PREFIX + "/investigations")
-def investigations(user=Depends(account)):
-    return listing(cases, user["id"])
+def investigations(offset: int = Param(0, ge=0), limit: int | None = Param(None, ge=1, le=200), user=Depends(account)):
+    records = listing(cases, user["id"])
+    return records[offset:offset + limit if limit is not None else None]
 
 
 @app.get(PREFIX + "/investigations/{identifier}")
@@ -249,19 +309,20 @@ def investigation(identifier: str, user=Depends(account)):
 
 
 @app.post(PREFIX + "/investigations/{identifier}/run")
-def run(identifier: str, user=Depends(account)):
+def run(identifier: str, user=Depends(writer)):
     owner = user["id"]
-    item = transition(get_case(identifier, owner), owner, {"Queued", "Failed"}, status="Running")
+    item = transition(get_case(identifier, owner), owner, {"Queued", "Failed"}, status="Running", trace=[])
     graph = workflow(owner)
     thread = config(f"{identifier}:{uuid4().hex}")
     try:
-        state = {key: item[key] for key in ("order_id", "customer_id", "complaint")}
+        state = {key: item[key] for key in ("order_id", "customer_id", "complaint", "context", "priority")}
         trace_count = 0
         for snapshot in graph.stream(state, thread, stream_mode="values"):
             trace = snapshot.get("trace", [])
             if len(trace) > trace_count:
                 stage = trace[-1]
-                event(owner, identifier, stage["agent"], "Agent completed", duration_ms=stage["duration_ms"])
+                event(owner, identifier, stage["agent"], "Agent completed", duration_ms=stage["duration_ms"],
+                      sources=stage["references"], tool_calls=stage["tool_calls"])
                 item = transition(item, owner, {"Running"}, trace=trace)
                 trace_count = len(trace)
         checkpoint = graph.get_state(thread)
@@ -280,8 +341,42 @@ def run(identifier: str, user=Depends(account)):
 
 @app.get(PREFIX + "/investigations/{identifier}/events")
 def events(identifier: str, user=Depends(account)):
-    get_case(identifier, user["id"])
-    return [row for row in listing(audit, user["id"]) if row["investigation_id"] == identifier]
+    item = get_case(identifier, None if reviewer(user) else user["id"])
+    return [row for row in listing(audit, item["owner"]) if row["investigation_id"] == identifier]
+
+
+@app.get(PREFIX + "/investigations/{identifier}/stream")
+def event_stream(identifier: str, request: Request, user=Depends(account)):
+    owner = user["id"]
+    get_case(identifier, owner)
+
+    async def stream():
+        seen = set()
+        for _ in range(80):
+            if await request.is_disconnected():
+                return
+            item = await asyncio.to_thread(get_case, identifier, owner)
+            records = await asyncio.to_thread(events, identifier, user)
+            for row in reversed(records):
+                if row["id"] not in seen:
+                    seen.add(row["id"])
+                    yield f"id: {row['id']}\ndata: {json.dumps(row)}\n\n"
+            if item["status"] not in {"Queued", "Running"}:
+                yield f"event: status\ndata: {json.dumps(item['status'])}\n\n"
+                return
+            await asyncio.sleep(.5)
+
+    return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-store"})
+
+
+@app.post(PREFIX + "/investigations/{identifier}/evidence")
+def add_evidence(identifier: str, body: Evidence, user=Depends(writer)):
+    owner = user["id"]
+    item = get_case(identifier, owner)
+    updated = transition(item, owner, {"Evidence requested", "Revision requested"}, context=body.context,
+                         status="Queued", trace=[], classification=None, resolution=None, policies=[], decision=None)
+    event(owner, identifier, owner, "Additional context recorded", previous_state=item["status"], new_state="Queued")
+    return updated
 
 
 @app.get(PREFIX + "/orders")
@@ -307,6 +402,15 @@ def agents(user=Depends(account)):
     return [{"name": name} for name in AGENTS]
 
 
+@app.get(PREFIX + "/agents/runs/{run_id}")
+def agent_run(run_id: str, user=Depends(account)):
+    for item in listing(cases, user["id"]):
+        for index, stage in enumerate(item.get("trace", []), 1):
+            if run_id == f"{item['id']}-{index}":
+                return {**stage, "id": run_id, "investigation_id": item["id"]}
+    raise HTTPException(404, "Agent run not found.")
+
+
 @app.get(PREFIX + "/policies")
 def policies(user=Depends(account)):
     return [dict(id=key, name=name, tags=tags, passage=passage, version="1.0")
@@ -321,7 +425,7 @@ def policy_search(body: Query, user=Depends(account)):
 @app.post(PREFIX + "/policies/upload", status_code=201)
 def upload(file: UploadFile = File(), name: str = Form(default="", max_length=120),
            version: str = Form(default="1.0", max_length=30),
-           tags: str = Form(default="", max_length=200), user=Depends(account)):
+           tags: str = Form(default="", max_length=200), user=Depends(writer)):
     data = file.file.read(2_000_001)
     if len(data) > 2_000_000:
         raise HTTPException(413, "Document must be 2 MB or smaller.")
@@ -347,21 +451,29 @@ def upload(file: UploadFile = File(), name: str = Form(default="", max_length=12
             content = data.decode("utf-8-sig")
     except Exception as exc:
         raise HTTPException(422, "Could not read document text.") from exc
+    return index_document(name or filename[:120], version, tags, content, filename[:120], user["id"])
+
+
+def index_document(title, version, tags, content, source, owner):
     content = content.strip()
     if not content or len(content) > 250_000:
         raise HTTPException(422, "Document must contain between 1 and 250,000 text characters.")
     identifier = uuid4().hex
-    title = name or filename[:120]
     chunks = [dict(id=identifier, name=title, section=str(index // 900 + 1), version=version,
                    effective_date=timestamp()[:10], tags=tags, passage=content[index:index + 1000],
-                   source=filename[:120]) for index in range(0, len(content), 900)]
+                   source=source) for index in range(0, len(content), 900)]
     document = dict(id=identifier, name=title, version=version, chunks=chunks, created_at=timestamp())
-    save(documents, user["id"], document)
+    save(documents, owner, document)
     return document
 
 
+@app.post(PREFIX + "/policies", status_code=201)
+def manual_policy(body: PolicyText, user=Depends(writer)):
+    return index_document(body.name, body.version, body.tags, body.content, "Manually entered policy", user["id"])
+
+
 @app.post(PREFIX + "/policies/reindex")
-def reindex(user=Depends(account)):
+def reindex(user=Depends(writer)):
     semantic_store.cache_clear()
     return {"documents": len(POLICIES) + len(listing(documents, user["id"])),
             "status": "Search cache cleared"}
@@ -369,27 +481,35 @@ def reindex(user=Depends(account)):
 
 @app.get(PREFIX + "/approvals")
 def approvals(user=Depends(account)):
-    scope = None if user["role"] in {"ADMIN", "SUPPORT_MANAGER"} else user["id"]
-    return [item for item in listing(cases, scope) if item["status"] == "Pending review"]
+    scope = None if reviewer(user) else user["id"]
+    return [item for item in listing(cases, scope) if item["status"] in {"Pending review", "Supervisor review"}]
 
 
 @app.post(PREFIX + "/approvals/{identifier}/{action}")
 def decide(identifier: str, action: str, body: Decision, user=Depends(account)):
-    statuses = {"approve": "Approved", "reject": "Rejected", "request-evidence": "Evidence requested"}
+    statuses = {"approve": "Approved", "reject": "Rejected", "request-evidence": "Evidence requested",
+                "request-revision": "Revision requested", "escalate": "Supervisor review"}
     if action not in statuses:
         raise HTTPException(404, "Unknown review action.")
-    if user["role"] not in {"ADMIN", "SUPPORT_MANAGER"}:
+    if not reviewer(user):
         raise HTTPException(403, "A support manager or administrator must record the decision.")
     item = get_case(identifier, None)
+    previous = item["status"]
+    if previous == "Supervisor review" and user["role"] != "ADMIN":
+        raise HTTPException(403, "An administrator must decide an escalated case.")
     owner = item["owner"]
-    item = transition(item, owner, {"Pending review"}, status="Review processing")
     decision = dict(action=action, notes=body.notes, actor=user["id"], at=timestamp())
+    if action == "escalate":
+        updated = transition(item, owner, {"Pending review"}, status=statuses[action], escalation=decision)
+        event(owner, identifier, user["id"], statuses[action], previous_state=previous, new_state=statuses[action])
+        return updated
+    item = transition(item, owner, {"Pending review", "Supervisor review"}, status="Review processing")
     try:
         workflow(owner).invoke(Command(resume=decision), config(item["thread"]))
     except Exception:
-        transition(item, owner, {"Review processing"}, status="Pending review")
+        transition(item, owner, {"Review processing"}, status=previous)
         raise
-    event(owner, identifier, user["id"], statuses[action])
+    event(owner, identifier, user["id"], statuses[action], previous_state=previous, new_state=statuses[action])
     return transition(item, owner, {"Review processing"}, status=statuses[action], decision=decision)
 
 
@@ -406,6 +526,18 @@ def resolution(identifier: str, user=Depends(account)):
     return item["resolution"]
 
 
+@app.patch(PREFIX + "/resolutions/{identifier}")
+def update_resolution(identifier: str, body: Draft, user=Depends(writer)):
+    owner = user["id"]
+    item = get_case(identifier, owner)
+    if not item.get("resolution"):
+        raise HTTPException(404, "Resolution not found.")
+    changed = transition(item, owner, {"Recommended", "Pending review", "Supervisor review", "Approved"},
+                         resolution={**item["resolution"], "draft": body.draft})
+    event(owner, identifier, owner, "Customer response draft updated")
+    return changed
+
+
 @app.get(PREFIX + "/audit-events")
 def audit_events(user=Depends(account)):
     return listing(audit, user["id"])
@@ -413,26 +545,40 @@ def audit_events(user=Depends(account)):
 
 @app.get(PREFIX + "/analytics/overview")
 @app.get(PREFIX + "/analytics/performance")
-def analytics(user=Depends(account)):
-    items = listing(cases, user["id"])
+def analytics(start: date | None = None, end: date | None = None, issue: str = "", severity: str = "",
+              status: str = "", agent: str = "", user=Depends(account)):
+    items = [item for item in listing(cases, user["id"])
+             if (start is None or item["created_at"][:10] >= start.isoformat())
+             and (end is None or item["created_at"][:10] <= end.isoformat())
+             and (not issue or (item.get("classification") or {}).get("issue_type") == issue)
+             and (not severity or (item.get("classification") or {}).get("severity") == severity)
+             and (not status or item["status"] == status)
+             and (not agent or any(stage["agent"] == agent for stage in item.get("trace", [])))]
     by_issue, by_day, by_status = {}, {}, {}
     timings = {agent: [] for agent in AGENTS}
     for item in items:
-        issue = item.get("classification", {}).get("issue_type", "UNCLASSIFIED")
+        issue = (item.get("classification") or {}).get("issue_type", "UNCLASSIFIED")
         day = item["created_at"][:10]
         status = item["status"]
         for bucket, key in ((by_issue, issue), (by_day, day), (by_status, status)):
             bucket[key] = bucket.get(key, 0) + 1
         for stage in item.get("trace", []):
-            timings[stage["agent"]].append(stage["duration_ms"])
+            if not agent or stage["agent"] == agent:
+                timings[stage["agent"]].append(stage["duration_ms"])
     completed = [item for item in items if item.get("resolution")]
-    return dict(total=len(items), pending=by_status.get("Pending review", 0),
-                resolved=by_status.get("Recommended", 0) + by_status.get("Approved", 0),
-                high_risk=sum(item.get("classification", {}).get("severity") == "HIGH" for item in items),
+    approved = by_status.get("Approved", 0)
+    decisions = approved + by_status.get("Rejected", 0)
+    escalated = sum(item["resolution"]["requires_approval"] for item in completed)
+    return dict(total=len(items), pending=by_status.get("Pending review", 0) + by_status.get("Supervisor review", 0),
+                resolved=by_status.get("Recommended", 0) + approved,
+                high_risk=sum((item.get("classification") or {}).get("severity") == "HIGH" for item in items),
                 average_ms=round(sum(sum(values) for values in timings.values()) / len(completed), 2) if completed else 0,
                 citation_rate=round(100 * sum(bool(item["policies"]) for item in completed) / len(completed)) if completed else 0,
+                approval_rate=round(100 * approved / decisions) if decisions else None,
+                escalation_rate=round(100 * escalated / len(completed)) if completed else None,
                 issues=by_issue, volume=by_day, statuses=by_status,
-                agents={name: round(sum(values) / len(values), 2) if values else 0 for name, values in timings.items()})
+                agents={name: round(sum(values) / len(values), 2) if values else 0 for name, values in timings.items()
+                        if not agent or name == agent})
 
 
 EVALUATION_CASES = [
@@ -462,7 +608,7 @@ def evaluation_cases(user=Depends(account)):
 
 
 @app.post(PREFIX + "/evaluations/run")
-def evaluation_run(user=Depends(account)):
+def evaluation_run(user=Depends(writer)):
     graph = build_graph(None, lambda query: search(query, issue_lookup=True))
     results = []
     for case in evaluation_cases(user):
@@ -472,8 +618,18 @@ def evaluation_run(user=Depends(account)):
         results.append({**case, "actual_issue": issue, "actual_review": approval,
                         "citations": len(result["policies"]),
                         "passed": issue == case["expected_issue"] and approval == case["expected_review"]})
-    report = dict(id=uuid4().hex, created_at=timestamp(), cases=results,
-                  passed=sum(item["passed"] for item in results), total=len(results))
+    by_category, confusion = {}, {}
+    for item in results:
+        counts = by_category.setdefault(item["category"], {"passed": 0, "total": 0})
+        counts["total"] += 1
+        counts["passed"] += item["passed"]
+        actual = confusion.setdefault(item["expected_issue"], {})
+        actual[item["actual_issue"]] = actual.get(item["actual_issue"], 0) + 1
+    passed = sum(item["passed"] for item in results)
+    previous = next(iter(listing(evaluations, user["id"])), None)
+    report = dict(id=uuid4().hex, created_at=timestamp(), cases=results, passed=passed, total=len(results),
+                  categories=by_category, confusion=confusion,
+                  regression_delta=passed - previous["passed"] if previous else None)
     save(evaluations, user["id"], report)
     return report
 

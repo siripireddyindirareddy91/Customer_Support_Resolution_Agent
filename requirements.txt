@@ -6,6 +6,7 @@ langgraph-checkpoint-sqlite>=3,<4
 langgraph-checkpoint-postgres>=3,<4
 psycopg[binary]>=3.2,<4
 sqlalchemy>=2,<3
+alembic>=1.15,<2
 PyJWT>=2.10,<3
 pwdlib[argon2]>=0.2,<1
 python-multipart>=0.0.22,<1

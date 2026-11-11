@@ -22,6 +22,8 @@ npm run dev
 
 Open `http://localhost:5173`. Vite proxies API calls to FastAPI. Local development defaults to SQLite for records and a separate SQLite file for LangGraph checkpoints. Set a persistent `JWT_SECRET` to preserve sessions across server restarts.
 
+The service creates its initial schema on first boot. To apply the versioned application schema explicitly, run `alembic upgrade head` with the same database environment. The LangGraph checkpoint store manages its own schema.
+
 ## Try the workflow
 
 Register an account and investigate `ORD-10452` with the complaint “My package is overdue and tracking has stopped updating.” The workflow looks up the order, classifies the issue, retrieves policy passages, and recommends a next step. Open Agent Workflow to inspect stage outputs and timestamps. Try `ORD-10453` for a failed attempt and `ORD-10454` for conflicting delivery evidence.
@@ -41,7 +43,7 @@ Register the reviewer first. Support agents can access their own investigations.
 - **Workflow** uses a typed LangGraph state, four stages, bounded retries and an interrupt before consequential actions. SQLite and PostgreSQL checkpoint implementations support local and hosted execution.
 - **Evidence** includes 30 synthetic orders and 90 tracking events seeded in the database, plus carrier status, support history and eight sample policies. References identify the originating system and record.
 - **Policy search** ranks text chunks by keyword overlap and uses issue tags during investigation. PDF, DOCX and UTF-8 TXT are supported. The default implementation uses deterministic classification and drafting and requires zero model credentials.
-- **Evaluation** runs 15 normal, ambiguous and adversarial fixtures against the same graph and saves results. Evaluation and investigation records can be exported as CSV.
+- **Evaluation** runs 15 normal, ambiguous and adversarial fixtures against the same graph and saves results. Reports show category pass rates, a classification confusion matrix and changes from the previous run. Evaluation and investigation records can be exported as CSV.
 
 ## Verification
 
@@ -54,7 +56,7 @@ npm ci
 npm run build
 ```
 
-Use a disposable development database for integration tests. They create synthetic accounts, an investigation, a review decision and an evaluation run.
+Set `RESOLVEFLOW_DATA_DIR` to a temporary directory with PostgreSQL environment variables unset to isolate SQLite integration tests. The tests create synthetic accounts, investigations, review decisions and an evaluation run.
 
 ## Deploy to Vercel
 
