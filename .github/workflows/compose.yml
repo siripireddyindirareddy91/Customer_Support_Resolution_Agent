@@ -1,0 +1,54 @@
+name: Docker Compose smoke test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start PostgreSQL and ResolveFlow
+        run: |
+          docker compose config --quiet
+          docker compose up --build -d --wait
+      - name: Check health and a persisted investigation
+        run: |
+          curl --fail --retry 20 --retry-delay 2 --retry-connrefused http://localhost:8000/api/health
+          python - <<'PY'
+          import json
+          from urllib.request import Request, urlopen
+          from uuid import uuid4
+
+          def api(path, body=None, token=None):
+              headers = {"Content-Type": "application/json"}
+              if token:
+                  headers["Authorization"] = "Bearer " + token
+              request = Request("http://localhost:8000/api/v1/" + path, headers=headers,
+                                data=json.dumps(body).encode() if body is not None else None)
+              with urlopen(request, timeout=30) as response:
+                  return json.load(response)
+
+          token = api("auth/register", {
+              "email": f"compose-{uuid4().hex}@example.com", "password": uuid4().hex,
+          })["token"]
+          assert len(api("orders", token=token)) == 42
+          case = api("investigations", {"complaint": "My order ORD-10452 is overdue."}, token)
+          result = api(f"investigations/{case['id']}/run", {}, token)
+          assert result["status"] == "Pending review"
+          assert len(result["trace"]) == 4
+          assert result["policies"][0]["retriever"] == "faiss"
+          PY
+      - name: Collect Compose logs
+        if: failure()
+        run: docker compose logs
+      - name: Stop test stack
+        if: always()
+        run: docker compose down --volumes
