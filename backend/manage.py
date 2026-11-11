@@ -3,7 +3,7 @@ import argparse
 
 from sqlalchemy import update
 
-from .main import engine, fetch, schema, users
+from .main import domain, engine, fetch, initialize_store, users
 
 
 def main():
@@ -12,12 +12,14 @@ def main():
     parser.add_argument("role", choices=["ADMIN", "SUPPORT_MANAGER", "SUPPORT_AGENT", "AUDITOR"])
     args = parser.parse_args()
     email = args.email.strip().lower()
-    schema.create_all(engine)
+    initialize_store()
     user = fetch(users, email)
     if user is None:
         parser.error("Register the account before assigning a role.")
     with engine.begin() as connection:
-        connection.execute(update(users).where(users.c.id == email).values(payload={**user, "role": args.role}))
+        updated = {**user, "role": args.role}
+        connection.execute(update(users).where(users.c.id == email).values(payload=updated))
+        domain.save(connection, users.name, updated)
     print(f"Assigned {args.role} to {email}.")
 
 

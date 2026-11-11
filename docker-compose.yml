@@ -17,6 +17,10 @@ services:
     environment:
       DATABASE_URL: postgresql://resolveflow:resolveflow-local@db:5432/resolveflow
       JWT_SECRET: ${JWT_SECRET:-resolveflow-local-development-only-change-me}
+      MODEL_API_BASE: ${MODEL_API_BASE:-}
+      MODEL_API_KEY: ${MODEL_API_KEY:-}
+      DRAFT_MODEL: ${DRAFT_MODEL:-}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
     depends_on:
       db:
         condition: service_healthy

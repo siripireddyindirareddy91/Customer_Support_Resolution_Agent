@@ -1,15 +1,18 @@
 """Optional API-backed models. The default deployment works without model credentials."""
 import json
+import logging
 import os
+import re
 from urllib.request import Request, urlopen
 
 from langchain_core.embeddings import Embeddings
 
 
-def model_request(path, body):
-    base = os.environ["MODEL_API_BASE"].rstrip("/")
+def model_request(path, body, gateway_token=None):
+    base = (os.getenv("MODEL_API_BASE") or "https://ai-gateway.vercel.sh/v1").rstrip("/")
+    api_key = os.getenv("MODEL_API_KEY") or gateway_token
     request = Request(base + path, data=json.dumps(body).encode(), headers={
-        "Authorization": "Bearer " + os.environ["MODEL_API_KEY"],
+        "Authorization": "Bearer " + api_key,
         "Content-Type": "application/json",
     })
     with urlopen(request, timeout=8) as response:
@@ -27,3 +30,28 @@ class PolicyEmbeddings(Embeddings):
 
 def enabled(variable):
     return all(os.getenv(key) for key in ("MODEL_API_BASE", "MODEL_API_KEY", variable))
+
+
+def generate_draft(action, reason, fallback, gateway_token=None):
+    if not enabled("DRAFT_MODEL") and not (gateway_token and os.getenv("DRAFT_MODEL")):
+        return fallback, "template"
+    try:
+        result = model_request("/chat/completions", {
+            "model": os.environ["DRAFT_MODEL"],
+            "max_tokens": 180,
+            "messages": [
+                {"role": "system", "content": (
+                    "Write a concise customer support reply. Use only the verified reason and next step. "
+                    "Describe the action as a recommendation. Never claim an action has already occurred, "
+                    "promise compensation, add tracking facts, ask for sensitive data, or include links. "
+                    "Return only the customer-facing text."
+                )},
+                {"role": "user", "content": json.dumps({"verified_reason": reason, "next_step": action})},
+            ],
+        }, gateway_token)
+        draft = result["choices"][0]["message"]["content"].strip()
+        if 20 <= len(draft) <= 1200 and not re.search(r"https?://|[<>]", draft, re.I):
+            return draft, "llm"
+    except (OSError, KeyError, IndexError, TypeError, ValueError, AttributeError):
+        logging.getLogger(__name__).warning("Draft model unavailable. Using the evidence-based template.")
+    return fallback, "template"

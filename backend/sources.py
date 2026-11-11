@@ -34,7 +34,7 @@ def lookup_order(order_id):
 
 
 def order_ids():
-    return [f"ORD-{i}" for i in range(10452, 10482)]
+    return [f"ORD-{i}" for i in range(10452, 10494)]
 
 
 def lookup_tracking(order):
@@ -57,4 +57,4 @@ def lookup_carrier_status(order):
 def lookup_customer_history(order):
     index = int(order["order_id"][-5:]) - 10452
     return [record("Customer Support", f"TKT-{7000 + index}", category="Delivery inquiry",
-                   status="Closed")] if index < 15 else []
+                   status="Closed" if index < 15 else "Open")] if index < 24 or index >= 30 else []

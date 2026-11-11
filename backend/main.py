@@ -25,7 +25,8 @@ from sqlalchemy import JSON, URL, Column, Integer, MetaData, String, Table, crea
 from sqlalchemy.exc import IntegrityError
 
 from .sources import AGENTS, POLICIES, lookup_order, lookup_tracking, order_ids
-from .retrieval import retrieve, semantic_store
+from .retrieval import demo_policies, retrieve, semantic_store
+from .relational import DomainStore
 from .workflow import build_graph
 
 PREFIX = "/api/v1"
@@ -54,6 +55,8 @@ audit = collection("audit_events")
 evaluations = collection("evaluation_runs")
 demo_orders = collection("orders")
 demo_tracking = collection("tracking_events")
+domain = DomainStore(schema)
+data_revisions = Table("data_revisions", schema, Column("id", String(128), primary_key=True))
 auth_limits = Table("auth_rate_limits", schema,
                     Column("key", String(64), primary_key=True),
                     Column("bucket", Integer, primary_key=True, index=True),
@@ -85,6 +88,7 @@ def listing(table, owner=None):
 def save(table, owner, payload):
     with engine.begin() as connection:
         connection.execute(insert(table).values(id=payload["id"], owner=owner, payload=payload))
+        domain.save(connection, table.name, payload)
 
 
 def event(owner, identifier, actor, kind, **metadata):
@@ -102,24 +106,59 @@ def persisted_tracking(order):
                   key=lambda row: row["timestamp"])
 
 
+def persisted_carrier(order):
+    with engine.connect() as connection:
+        rows = domain.read(connection, "carrier_updates", shipment_id=order["shipment_id"])
+    return {**rows[0]["evidence"], "retrieved_at": timestamp()}
+
+
+def persisted_support(order):
+    with engine.connect() as connection:
+        rows = domain.read(connection, "support_tickets", order_id=order["order_id"])
+    return [{**row["evidence"], "retrieved_at": timestamp()} for row in rows]
+
+
 def initialize_store():
     with engine.begin() as connection:
         if DATABASE:
             connection.execute(text("SELECT pg_advisory_xact_lock(83214753)"))
         schema.create_all(connection)
-        if connection.execute(select(demo_orders.c.id).limit(1)).first():
+        if connection.execute(select(data_revisions.c.id).where(data_revisions.c.id == "relational-v1")).first():
             return
+        domain.seed_roles(connection)
+        existing = dict(connection.execute(select(demo_orders.c.id, demo_orders.c.payload)).all())
         for identifier in order_ids():
-            order = lookup_order(identifier)
-            connection.execute(insert(demo_orders).values(id=identifier, owner="demo", payload=order))
-            connection.execute(insert(demo_tracking), [
-                dict(id=event["record_id"], owner=order["shipment_id"], payload=event)
-                for event in lookup_tracking(order)
-            ])
+            order = existing.get(identifier)
+            if order:
+                tracking = connection.execute(select(demo_tracking.c.payload).where(
+                    demo_tracking.c.owner == order["shipment_id"])).scalars().all()
+            else:
+                order = lookup_order(identifier)
+                tracking = lookup_tracking(order)
+                connection.execute(insert(demo_orders).values(id=identifier, owner="demo", payload=order))
+                connection.execute(insert(demo_tracking), [
+                    dict(id=event["record_id"], owner=order["shipment_id"], payload=event) for event in tracking
+                ])
+            domain.order(connection, order, tracking)
+        for policy in demo_policies():
+            doc = {**policy, "chunks": [policy]}
+            if not connection.execute(select(documents.c.id).where(documents.c.id == doc["id"])).first():
+                connection.execute(insert(documents).values(id=doc["id"], owner="demo", payload=doc))
+        for table in (users, cases, documents, evaluations, audit):
+            for item in connection.execute(select(table.c.payload)).scalars().all():
+                domain.save(connection, table.name, item)
+        for index, item in enumerate(evaluation_cases(), 1):
+            domain.evaluation_case(connection, index, item)
+        connection.execute(insert(data_revisions).values(id="relational-v1"))
 
 
 def search(query, owner=None, *, issue_lookup=False):
-    custom = [chunk for doc in listing(documents, owner) for chunk in doc["chunks"]] if owner else []
+    chunks = domain.tables["policy_chunks"]
+    custom = []
+    if owner:
+        with engine.connect() as connection:
+            custom = list(connection.execute(select(chunks.c.evidence).join(
+                documents, documents.c.id == chunks.c.document_id).where(documents.c.owner == owner)).scalars())
     return retrieve(query, custom, issue_lookup)
 
 
@@ -272,12 +311,14 @@ def transition(item, owner, expected, **changes):
             func.coalesce(cases.c.payload["revision"].as_integer(), 0) == revision).values(payload=changed))
         if result.rowcount != 1:
             raise HTTPException(409, "The investigation changed. Refresh and try again.")
+        domain.case(connection, changed)
     return changed
 
 
-def workflow(owner):
+def workflow(owner, gateway_token=None):
     return build_graph(app.state.checkpointer, lambda query: search(query, owner, issue_lookup=True),
-                       persisted_order, persisted_tracking)
+                       persisted_order, persisted_tracking, gateway_token=gateway_token,
+                       carrier_source=persisted_carrier, support_source=persisted_support)
 
 
 def config(identifier):
@@ -309,11 +350,14 @@ def investigation(identifier: str, user=Depends(account)):
 
 
 @app.post(PREFIX + "/investigations/{identifier}/run")
-def run(identifier: str, user=Depends(writer)):
+def run(identifier: str, request: Request, user=Depends(writer)):
     owner = user["id"]
-    item = transition(get_case(identifier, owner), owner, {"Queued", "Failed"}, status="Running", trace=[])
-    graph = workflow(owner)
-    thread = config(f"{identifier}:{uuid4().hex}")
+    thread_id = f"{identifier}:{uuid4().hex}"
+    item = transition(get_case(identifier, owner), owner, {"Queued", "Failed"},
+                      status="Running", trace=[], run_thread=thread_id)
+    gateway_token = (os.getenv("VERCEL_OIDC_TOKEN") or request.headers.get("x-vercel-oidc-token")) if os.getenv("VERCEL") else None
+    graph = workflow(owner, gateway_token)
+    thread = config(thread_id)
     try:
         state = {key: item[key] for key in ("order_id", "customer_id", "complaint", "context", "priority")}
         trace_count = 0
@@ -533,7 +577,7 @@ def update_resolution(identifier: str, body: Draft, user=Depends(writer)):
     if not item.get("resolution"):
         raise HTTPException(404, "Resolution not found.")
     changed = transition(item, owner, {"Recommended", "Pending review", "Supervisor review", "Approved"},
-                         resolution={**item["resolution"], "draft": body.draft})
+                         resolution={**item["resolution"], "draft": body.draft, "draft_source": "manual"})
     event(owner, identifier, owner, "Customer response draft updated")
     return changed
 
@@ -609,7 +653,7 @@ def evaluation_cases(user=Depends(account)):
 
 @app.post(PREFIX + "/evaluations/run")
 def evaluation_run(user=Depends(writer)):
-    graph = build_graph(None, lambda query: search(query, issue_lookup=True))
+    graph = build_graph(None, lambda query: search(query, issue_lookup=True), model_drafts=False)
     results = []
     for case in evaluation_cases(user):
         result = graph.invoke({"order_id": case["order_id"], "complaint": case["complaint"]})

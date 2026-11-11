@@ -3,7 +3,7 @@ from uuid import uuid4
 from fastapi.testclient import TestClient
 from sqlalchemy import update
 
-from backend.main import app, engine, fetch, users
+from backend.main import app, domain, engine, fetch, users
 
 
 def register(client):
@@ -34,6 +34,7 @@ def test_investigation_requires_review_and_preserves_audit():
         assert case["classification"]["issue_type"] == "MAJOR_DELAY"
         assert len(case["trace"]) == 4
         assert case["policies"][0]["id"] == "P-01"
+        assert case["policies"][0]["retriever"] == "faiss"
         saved = client.patch(f"/api/v1/resolutions/{identifier}", headers=agent,
                              json={"draft": "We are checking your shipment with the carrier."})
         assert saved.status_code == 200, saved.text
@@ -47,6 +48,10 @@ def test_investigation_requires_review_and_preserves_audit():
         assert client.post(decision_path, headers=manager, json={"notes": "Duplicate request"}).status_code == 409
         events = client.get(path + "/events", headers=agent).json()
         assert len(events) == 8
+        with engine.connect() as connection:
+            assert len(domain.read(connection, "investigation_agent_runs", investigation_id=identifier)) == 4
+            assert domain.read(connection, "classifications", investigation_id=identifier)[0]["issue_type"] == "MAJOR_DELAY"
+            assert domain.read(connection, "human_approvals", investigation_id=identifier)[0]["reviewer_id"] == manager_email
 
 
 def test_evaluations_and_policy_upload():
@@ -86,3 +91,26 @@ def test_review_evidence_can_resume_and_rerun():
         rerun = client.post(path + "/run", headers=reviewer)
         assert rerun.status_code == 200, rerun.text
         assert rerun.json()["classification"]["flags"] == ["REFUND"]
+
+
+def test_model_draft_receives_only_verified_facts(monkeypatch):
+    from backend import providers
+    monkeypatch.setenv("MODEL_API_BASE", "https://example.invalid/v1")
+    monkeypatch.setenv("MODEL_API_KEY", "test-only")
+    monkeypatch.setenv("DRAFT_MODEL", "test-model")
+
+    def reply(path, body, gateway_token):
+        assert path == "/chat/completions"
+        assert "private complaint marker" not in str(body)
+        assert "recorded an attempted delivery" in str(body)
+        return {"choices": [{"message": {"content": "We can confirm the carrier attempted delivery and recommend checking the next attempt."}}]}
+
+    monkeypatch.setattr(providers, "model_request", reply)
+    with TestClient(app) as client:
+        _, agent = register(client)
+        case = client.post("/api/v1/investigations", headers=agent, json={
+            "order_id": "ORD-10453", "complaint": "private complaint marker",
+        }).json()
+        item = client.post(f"/api/v1/investigations/{case['id']}/run", headers=agent)
+        assert item.status_code == 200, item.text
+        assert item.json()["resolution"]["draft_source"] == "llm"

@@ -4,6 +4,7 @@ from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import RetryPolicy, interrupt
+from .providers import generate_draft
 
 from .sources import AGENTS, lookup_carrier_status, lookup_customer_history, lookup_order, lookup_tracking
 
@@ -27,13 +28,14 @@ class State(TypedDict, total=False):
     decision: dict
 
 
-def lookup(state, order_source=lookup_order, tracking_source=lookup_tracking):
+def lookup(state, order_source=lookup_order, tracking_source=lookup_tracking,
+           carrier_source=lookup_carrier_status, support_source=lookup_customer_history):
     order = order_source(state["order_id"])
     if order and state.get("customer_id") and state["customer_id"] != order["customer_id"]:
         order = None
     return {"order": order, "tracking": tracking_source(order) if order else [],
-            "carrier": lookup_carrier_status(order) if order else None,
-            "history": lookup_customer_history(order) if order else [],
+            "carrier": carrier_source(order) if order else None,
+            "history": support_source(order) if order else [],
             "lookup_status": "VERIFIED" if order else "NOT_FOUND"}
 
 
@@ -73,7 +75,7 @@ def classify(state):
                                    requires_human_review=bool(review or flags or score < .75))}
 
 
-def handoff(state):
+def handoff(state, model_drafts=True, gateway_token=None):
     classification = state["classification"]
     issue = classification["issue_type"]
     action = {
@@ -88,15 +90,20 @@ def handoff(state):
         action = "Refer refund eligibility to a support reviewer"
     if not state["policies"]:
         action = "Request policy review"
+    fallback = ("Thanks for contacting support. " + classification["reasoning"] +
+                " Our recommended next step is to " + action[0].lower() + action[1:] + ".")
+    draft, draft_source = (generate_draft(action, classification["reasoning"], fallback, gateway_token)
+                           if model_drafts else (fallback, "template"))
     return {"resolution": dict(action=action, reason=classification["reasoning"],
                                citations=state["policies"], confidence=classification["confidence"],
-                               draft="Thanks for contacting support. " + classification["reasoning"] +
-                                     " Our recommended next step is to " + action[0].lower() + action[1:] + ".",
+                               draft=draft, draft_source=draft_source,
                                priority="Urgent" if classification["severity"] == "HIGH" else state.get("priority", "Normal"),
                                requires_approval=classification["requires_human_review"] or not state["policies"])}
 
 
-def build_graph(checkpointer, search, order_source=lookup_order, tracking_source=lookup_tracking):
+def build_graph(checkpointer, search, order_source=lookup_order, tracking_source=lookup_tracking, *,
+                model_drafts=True, gateway_token=None, carrier_source=lookup_carrier_status,
+                support_source=lookup_customer_history):
     def retrieve(state):
         classification = state["classification"]
         policies = search(" ".join([classification["issue_type"], *classification["flags"]]))
@@ -128,7 +135,8 @@ def build_graph(checkpointer, search, order_source=lookup_order, tracking_source
 
     graph = StateGraph(State)
     names = ("lookup", "classify", "retrieve", "handoff")
-    operations = (lambda state: lookup(state, order_source, tracking_source), classify, retrieve, handoff)
+    operations = (lambda state: lookup(state, order_source, tracking_source, carrier_source, support_source),
+                  classify, retrieve, lambda state: handoff(state, model_drafts, gateway_token))
     for index, (name, operation) in enumerate(zip(names, operations)):
         graph.add_node(name, traced(index, operation), retry_policy=RetryPolicy(max_attempts=2))
     graph.add_edge(START, "lookup")

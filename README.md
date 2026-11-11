@@ -41,13 +41,15 @@ Register the reviewer first. Support agents can access their own investigations.
 - **Frontend** uses React, TypeScript, Vite, Lucide and Recharts. Charts are computed from stored investigations, and workflow progress polls stored execution traces.
 - **Backend** uses FastAPI, Argon2 password hashes, signed JWTs and SQLAlchemy. Swagger UI is at `/api/docs`.
 - **Workflow** uses a typed LangGraph state, four stages, bounded retries and an interrupt before consequential actions. SQLite and PostgreSQL checkpoint implementations support local and hosted execution.
-- **Evidence** includes 30 synthetic orders and 90 tracking events seeded in the database, plus carrier status, support history and eight sample policies. References identify the originating system and record.
-- **Policy search** ranks text chunks by keyword overlap and uses issue tags during investigation. PDF, DOCX and UTF-8 TXT are supported. The default implementation uses deterministic classification and drafting and requires zero model credentials.
+- **Evidence** includes 42 synthetic orders and 126 tracking events, plus carrier updates, support history and eight sample policies. The relational migration adds foreign-key-backed domain tables for roles, customers, shipments, agent runs, classifications, resolutions, approvals, policy chunks, and evaluation results. Startup backfills these records from existing API snapshots without dropping historical data.
+- **Policy search** ranks eligible passages with FAISS. It uses deterministic local vectors by default and supports hosted semantic embeddings for the synthetic catalog. PDF, DOCX and UTF-8 TXT are supported.
 - **Evaluation** runs 15 normal, ambiguous and adversarial fixtures against the same graph and saves results. Reports show category pass rates, a classification confusion matrix and changes from the previous run. Evaluation and investigation records can be exported as CSV.
 
 ## Verification
 
-Optional semantic search over the synthetic policy catalog uses LangChain. Install NumPy and configure `MODEL_API_BASE`, `MODEL_API_KEY`, and `EMBEDDING_MODEL` for an embeddings provider compatible with the `/embeddings` endpoint. Search queries are sent to the configured provider when semantic search is active. Uploaded policy documents and investigation evidence stay in the application.
+Set `MODEL_API_BASE`, `MODEL_API_KEY`, and `DRAFT_MODEL` to enable customer-response generation through a provider compatible with `/chat/completions`. Vercel AI Gateway also supports production OIDC authentication. The provider receives the verified finding and recommended action. Raw complaints, identifiers, and uploaded policies are excluded. A template is used if generation is disabled or unavailable. Drafting leaves the approval rules intact.
+
+To enable hosted semantic search for the synthetic policy catalog, set `EMBEDDING_MODEL` alongside the provider base URL and key. Search queries are sent to the configured provider when hosted semantic search is active. Uploaded policy documents use local FAISS vectors.
 
 ```sh
 python -m pip install pytest httpx

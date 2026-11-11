@@ -1154,6 +1154,15 @@ function App() {
                     <Citations matches={selected.policies} />
                     <label>
                       Customer response draft
+                      {selected.resolution.draft_source && (
+                        <small>
+                          {selected.resolution.draft_source === "llm"
+                            ? "Model-generated draft"
+                            : selected.resolution.draft_source === "manual"
+                              ? "Edited by a support agent"
+                              : "Evidence-based template"}
+                        </small>
+                      )}
                       <textarea
                         value={draft.value}
                         maxLength={4000}

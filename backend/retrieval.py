@@ -1,9 +1,10 @@
 import logging
 import re
 from functools import lru_cache
+from hashlib import blake2b
 
-from langchain_core.documents import Document
-from langchain_core.vectorstores import InMemoryVectorStore
+import faiss
+import numpy as np
 
 from .providers import PolicyEmbeddings, enabled
 from .sources import POLICIES
@@ -21,31 +22,53 @@ def demo_policies():
             for key, name, tags, passage in POLICIES]
 
 
-@lru_cache(maxsize=1)
-def semantic_store():
-    store = InMemoryVectorStore(PolicyEmbeddings())
-    store.add_documents([Document(page_content=policy["name"] + "\n" + policy["passage"], metadata=policy)
-                         for policy in demo_policies()])
-    return store
+def local_vectors(texts):
+    vectors = np.zeros((len(texts), 2048), dtype=np.float32)
+    for index, text in enumerate(texts):
+        for word in words(text):
+            bucket = int.from_bytes(blake2b(word.encode(), digest_size=4).digest(), "little") % 2048
+            vectors[index, bucket] += 1
+    return vectors
+
+
+@lru_cache(maxsize=32)
+def semantic_store(texts, remote=False):
+    vectors = np.asarray(PolicyEmbeddings().embed_documents(list(texts)) if remote else local_vectors(texts),
+                         dtype=np.float32)
+    faiss.normalize_L2(vectors)
+    index = faiss.IndexFlatIP(vectors.shape[1])
+    index.add(vectors)
+    return index
+
+
+def ranked(query, candidates, issue_lookup, remote=False):
+    texts = tuple(item["tags"] if issue_lookup else " ".join((item["tags"], item["name"], item["passage"]))
+                  for item in candidates)
+    index = semantic_store(texts, remote) if not any(not item["id"].startswith("P-") for item in candidates) else None
+    if index is None:
+        vectors = local_vectors(texts)
+        faiss.normalize_L2(vectors)
+        index = faiss.IndexFlatIP(vectors.shape[1])
+        index.add(vectors)
+    query_vector = np.asarray([PolicyEmbeddings().embed_query(query)] if remote else local_vectors([query]),
+                              dtype=np.float32)
+    faiss.normalize_L2(query_vector)
+    scores, positions = index.search(query_vector, min(5, len(candidates)))
+    return [{**candidates[int(position)], "score": round(float(score), 3), "retriever": "faiss"}
+            for score, position in zip(scores[0], positions[0]) if position >= 0 and score > (.35 if remote else 0)]
 
 
 def retrieve(query, custom, issue_lookup=False):
     terms = words(query)
     if not terms:
         return []
+    candidates = demo_policies() + custom
     if enabled("EMBEDDING_MODEL") and not custom and not issue_lookup:
         try:
-            found = semantic_store().similarity_search_with_score(query, k=5)
-            return [{**document.metadata, "score": round(float(score), 3)}
-                    for document, score in found if score >= .35]
-        except (ImportError, OSError, KeyError, TypeError, ValueError):
-            logger.warning("Semantic policy search unavailable. Using lexical retrieval.")
-
-    matches = []
-    for policy in demo_policies() + custom:
-        tags = words(policy["tags"])
-        indexed = tags if issue_lookup else tags | words(policy["name"] + " " + policy["passage"])
-        overlap = terms & indexed
-        if overlap:
-            matches.append({**policy, "score": round(len(overlap) / len(terms), 3)})
-    return sorted(matches, key=lambda item: item["score"], reverse=True)[:5]
+            return ranked(query, candidates, False, remote=True)
+        except (OSError, KeyError, RuntimeError, TypeError, ValueError):
+            logger.warning("Embedding provider unavailable. Using local FAISS vectors.")
+    candidates = [item for item in candidates if terms & (
+        words(item["tags"]) if issue_lookup else words(" ".join((item["tags"], item["name"], item["passage"])))
+    )]
+    return ranked(query, candidates, issue_lookup) if candidates else []
